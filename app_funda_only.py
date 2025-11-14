@@ -1,11 +1,11 @@
- # app_funda_only_yahoo.py
+# app_funda_only_yahoo.py
 import os, io, time, math, requests
 import pandas as pd
 import numpy as np
 import streamlit as st
 from dotenv import load_dotenv
 
-# Option Yahoo: yahooquery (plus riche que yfinance pour les fondamentaux)
+# Yahoo fundamentals via yahooquery (plus riche que yfinance)
 try:
     from yahooquery import Ticker
 except ImportError:
@@ -20,7 +20,8 @@ st.title("📘 S&P 500 — Fundamentals Only (Yahoo Finance)")
 load_dotenv()  # pas de clé requise pour Yahoo, mais on garde la compatibilité
 
 if Ticker is None:
-    st.error("Le paquet 'yahooquery' n'est pas installé. Fais:  \n"
+    st.error("Le paquet 'yahooquery' n'est pas installé.\n\n"
+             "Installe :  \n"
              "`pip install yahooquery streamlit pandas numpy python-dotenv requests lxml`")
     st.stop()
 
@@ -102,6 +103,7 @@ def pctile_or_neutral(s: pd.Series) -> pd.Series:
 # ------------------------
 YQ_CHUNK = 40  # batch pour éviter rate-limit
 
+# Map Yahoo -> nos colonnes
 YQ_FIELDS = {
     # Qualité
     "grossMargins": ("quality", "gross_margin"),            # marge brute %
@@ -114,7 +116,7 @@ YQ_FIELDS = {
     "debtToEquity": ("safety", "debt_to_equity"),           # %
     "currentRatio": ("safety", "current_ratio"),            # ratio
     "quickRatio": ("safety", "quick_ratio"),
-    # Bonus (informatifs)
+    # Bonus info
     "trailingPE": ("info", "pe"),
     "priceToBook": ("info", "pb"),
     "beta": ("info", "beta"),
@@ -127,23 +129,20 @@ def fetch_yahoo_fundamentals(tickers: list[str]) -> pd.DataFrame:
       - financial_data
       - summary_detail
       - key_stats  (en renfort si dispo)
-    Agrège dans un seul DataFrame: une ligne par ticker avec nos colonnes cibles.
+    Renvoie 1 ligne par ticker avec nos colonnes cibles.
     """
     all_rows = []
     for i in range(0, len(tickers), YQ_CHUNK):
         batch = tickers[i:i+YQ_CHUNK]
         t = Ticker(batch, asynchronous=True)
 
-        # Dicos par module
         fd = t.financial_data or {}
         sd = t.summary_detail or {}
-        ks = t.key_stats or {}  # peut être vide selon symboles
+        ks = t.key_stats or {}
 
         for sym in batch:
             row = {"ticker": sym}
-            # helper pour piocher dans les 3 dicos
             def g(key):
-                # ordre de priorité : financial_data -> summary_detail -> key_stats
                 v = None
                 if isinstance(fd.get(sym), dict):
                     v = fd[sym].get(key, None)
@@ -153,52 +152,50 @@ def fetch_yahoo_fundamentals(tickers: list[str]) -> pd.DataFrame:
                     v = ks[sym].get(key, None)
                 return v
 
-            # map champs
             for yq_key, (_, our_name) in YQ_FIELDS.items():
                 row[our_name] = g(yq_key)
 
             all_rows.append(row)
 
-        # petite pause douce pour éviter throttling
-        time.sleep(0.4)
+        time.sleep(0.4)  # pause douce
 
     df = pd.DataFrame(all_rows).drop_duplicates(subset=["ticker"], keep="last").reset_index(drop=True)
     return df
 
 # ------------------------
-# SCORING
+# SCORING (score en 1ère colonne)
 # ------------------------
 def compute_score_yahoo(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
 
-    # Sous-scores
+    # Sous-scores : listes de colonnes
     q_cols = ["gross_margin", "net_margin", "roe"]
     g_cols = ["revenue_growth", "eps_growth"]
-    s_cols = ["debt_to_equity", "current_ratio"]  # quick_ratio reste informatif
 
-    # Inversion sur D/E (plus bas = mieux)
+    # D/E inversé (plus bas = mieux)
     inv_de = -pd.to_numeric(d["debt_to_equity"], errors="coerce")
     d["_inv_de"] = inv_de
 
-    # Construire percentiles (neutre 50 si colonne vide)
+    # Percentiles avec neutralisation si colonne vide
     q = [pctile_or_neutral(pd.to_numeric(d[c], errors="coerce")) for c in q_cols]
     quality = sum(q) / len(q)
 
     g = [pctile_or_neutral(pd.to_numeric(d[c], errors="coerce")) for c in g_cols]
     growth = sum(g) / len(g)
 
-    s = [pctile_or_neutral(d["_inv_de"]), pctile_or_neutral(pd.to_numeric(d["current_ratio"], errors="coerce"))]
+    s = [pctile_or_neutral(d["_inv_de"]),
+         pctile_or_neutral(pd.to_numeric(d["current_ratio"], errors="coerce"))]
     safety = sum(s) / len(s)
 
-    score = 0.40*quality + 0.35*growth + 0.25*safety
+    score = 0.40 * quality + 0.35 * growth + 0.25 * safety
 
     out = pd.DataFrame({
+        "score": score.round(2),  # ✅ score en premier
         "ticker": d["ticker"],
         "quality": quality.round(2),
         "growth": growth.round(2),
         "safety": safety.round(2),
-        "score": score.round(2),
-        # Exposer quelques champs bruts utiles
+        # Champs bruts utiles
         "gross_margin": d["gross_margin"],
         "net_margin": d["net_margin"],
         "roe": d["roe"],
@@ -245,7 +242,7 @@ if run_btn:
     st.write(f"📦 Fondamentaux récupérés via Yahoo : **{len(funda)}** / {len(universe)}")
 
     if len(funda) == 0:
-        st.warning("Aucune donnée récupérée via Yahoo. Réessaie plus tard ou réduis le nombre de tickers.")
+        st.warning("Aucune donnée récupérée via Yahoo. Réduis le nombre de tickers ou réessaie plus tard.")
         st.stop()
 
     if show_raw:
@@ -253,13 +250,49 @@ if run_btn:
         st.dataframe(funda.head(10))
 
     scored = compute_score_yahoo(funda)
+
+    # Merge pour récupérer secteur/industrie et calculer les moyennes par secteur
     merged = universe.merge(scored, on="ticker", how="inner")
     out = merged[merged["score"] >= min_score].sort_values("score", ascending=False).reset_index(drop=True)
+
+    # ------------------------
+    # 🧮 Moyennes par secteur
+    # ------------------------
+    # On agrège sur quelques colonnes clés
+    sector_cols = [
+        "score", "quality", "growth", "safety",
+        "gross_margin", "net_margin", "roe",
+        "revenue_growth", "eps_growth",
+        "debt_to_equity", "current_ratio"
+    ]
+    # Moyennes pondérées simples (arithmétiques)
+    sector_summary = (
+        merged[["sector"] + sector_cols]
+        .groupby("sector", dropna=False)
+        .mean(numeric_only=True)
+        .round(2)
+        .sort_values("score", ascending=False)
+        .reset_index()
+    )
 
     st.subheader("📋 Résultats (Yahoo fondamentaux)")
     st.dataframe(out)
 
-    st.download_button("📥 Exporter CSV",
-                       data=out.to_csv(index=False),
-                       file_name="sp500_fundamentals_yahoo.csv",
-                       mime="text/csv")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "📥 Exporter CSV — Résultats",
+            data=out.to_csv(index=False),
+            file_name="sp500_fundamentals_yahoo_results.csv",
+            mime="text/csv"
+        )
+    with c2:
+        st.download_button(
+            "📥 Exporter CSV — Moyennes par secteur",
+            data=sector_summary.to_csv(index=False),
+            file_name="sp500_fundamentals_yahoo_sector_summary.csv",
+            mime="text/csv"
+        )
+
+    st.subheader("🏷️ Moyennes par secteur (score, sous-scores, ratios)")
+    st.dataframe(sector_summary)
