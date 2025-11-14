@@ -14,8 +14,8 @@ except ImportError:
 # ------------------------
 # SETUP
 # ------------------------
-st.set_page_config(page_title="S&P 500 — Score Fondamental (Yahoo)", layout="wide")
-st.title("📘 S&P 500 — Score Fondamental (Yahoo Finance)")
+st.set_page_config(page_title="S&P 500 — Score Fondamental", layout="wide")
+st.title("📘 S&P 500 — Score Fondamental")
 
 load_dotenv()  # pas de clé requise pour Yahoo, mais on garde la compatibilité
 
