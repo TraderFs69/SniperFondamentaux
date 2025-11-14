@@ -1,21 +1,28 @@
-import os, io, time, requests
+ # app_funda_only_yahoo.py
+import os, io, time, math, requests
 import pandas as pd
 import numpy as np
 import streamlit as st
 from dotenv import load_dotenv
 
+# Option Yahoo: yahooquery (plus riche que yfinance pour les fondamentaux)
+try:
+    from yahooquery import Ticker
+except ImportError:
+    Ticker = None
+
 # ------------------------
 # SETUP
 # ------------------------
-st.set_page_config(page_title="S&P 500 — Fundamentals Only (FMP)", layout="wide")
-st.title("📘 S&P 500 — Fundamentals Only (Financial Modeling Prep)")
+st.set_page_config(page_title="S&P 500 — Fundamentals Only (Yahoo)", layout="wide")
+st.title("📘 S&P 500 — Fundamentals Only (Yahoo Finance)")
 
-load_dotenv()
-FMP = os.getenv("FMP_API_KEY", "")
+load_dotenv()  # pas de clé requise pour Yahoo, mais on garde la compatibilité
 
-if not FMP:
-    st.warning("ℹ️ Aucun FMP_API_KEY détecté dans `.env`. Certaines requêtes FMP fonctionnent sans clé mais sont limitées. "
-               "Idéalement, ajoute FMP_API_KEY=ta_clef_dans_.env (clé gratuite dispo sur financialmodelingprep.com).")
+if Ticker is None:
+    st.error("Le paquet 'yahooquery' n'est pas installé. Fais:  \n"
+             "`pip install yahooquery streamlit pandas numpy python-dotenv requests lxml`")
+    st.stop()
 
 # ------------------------
 # HELPERS
@@ -84,96 +91,104 @@ def fetch_sp500_universe():
         st.warning(f"Wikipédia indisponible/bloqué ({e}). Utilisation d’une source de secours.")
         return fetch_sp500_fallback()
 
-def api_json(url, params=None, tries=3, sleep=0.7):
-    params = params or {}
-    for i in range(tries):
-        try:
-            r = requests.get(url, params=params, timeout=30)
-            if r.status_code == 200:
-                return r.json()
-            if r.status_code in (429, 502, 503):
-                time.sleep(sleep*(i+1))
-                continue
-        except requests.RequestException:
-            time.sleep(sleep*(i+1))
-    return None
+def pctile_or_neutral(s: pd.Series) -> pd.Series:
+    s2 = pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    if s2.dropna().empty:
+        return pd.Series(50.0, index=s.index)  # neutre si colonne vide
+    return 100 * s2.fillna(s2.median()).rank(pct=True)
 
 # ------------------------
-# FUNDAMENTALS VIA FMP
+# RÉCUP FUNDAMENTAUX YAHOO (yahooquery)
 # ------------------------
-def fmp_ratios_ttm(ticker: str):
-    url = f"https://financialmodelingprep.com/api/v3/ratios-ttm/{ticker}"
-    params = {"apikey": FMP} if FMP else {}
-    js = api_json(url, params=params)
-    if not js or not isinstance(js, list) or len(js)==0:
-        return None
-    rec = js[0]
-    def g(k): return rec.get(k, np.nan)
-    return dict(
-        gross_margin=g("grossProfitMarginTTM"),
-        net_margin=g("netProfitMarginTTM"),
-        roic=g("returnOnInvestedCapitalTTM"),
-        revenue_growth=g("revenueGrowthTTM"),
-        eps_growth=g("epsGrowthTTM"),
-        debt_to_equity=g("debtEquityTTM"),
-        interest_coverage=g("interestCoverageTTM"),
-    )
+YQ_CHUNK = 40  # batch pour éviter rate-limit
 
-def fmp_key_metrics_ttm(ticker: str):
-    url = f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{ticker}"
-    params = {"apikey": FMP} if FMP else {}
-    js = api_json(url, params=params)
-    if not js or not isinstance(js, list) or len(js)==0:
-        return None
-    rec = js[0]
-    def g(k): return rec.get(k, np.nan)
-    return dict(
-        gross_margin=g("grossProfitMarginTTM"),
-        net_margin=g("netProfitMarginTTM"),
-        roic=g("roicTTM") or g("returnOnInvestedCapitalTTM"),
-        revenue_growth=g("revenueGrowthTTM"),
-        eps_growth=g("epsdilutedGrowthTTM") or g("epsGrowthTTM"),
-        debt_to_equity=g("debtToEquityTTM") or g("debtEquityTTM"),
-        interest_coverage=np.nan
-    )
+YQ_FIELDS = {
+    # Qualité
+    "grossMargins": ("quality", "gross_margin"),            # marge brute %
+    "profitMargins": ("quality", "net_margin"),             # marge nette %
+    "returnOnEquity": ("quality", "roe"),                   # ROE %
+    # Croissance
+    "revenueGrowth": ("growth", "revenue_growth"),          # YoY
+    "earningsQuarterlyGrowth": ("growth", "eps_growth"),    # proxy EPS growth
+    # Solidité
+    "debtToEquity": ("safety", "debt_to_equity"),           # %
+    "currentRatio": ("safety", "current_ratio"),            # ratio
+    "quickRatio": ("safety", "quick_ratio"),
+    # Bonus (informatifs)
+    "trailingPE": ("info", "pe"),
+    "priceToBook": ("info", "pb"),
+    "beta": ("info", "beta"),
+}
 
-def get_funda_for(ticker: str):
-    d = fmp_ratios_ttm(ticker)
-    if d is None:
-        d = {}
-    km = fmp_key_metrics_ttm(ticker)
-    if km:
-        for k, v in km.items():
-            if (k not in d) or (pd.isna(d[k])):
-                d[k] = v
-    if not d:
-        return None
-    d["ticker"] = ticker
-    return d
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_yahoo_fundamentals(tickers: list[str]) -> pd.DataFrame:
+    """
+    Récupère par batch via yahooquery:
+      - financial_data
+      - summary_detail
+      - key_stats  (en renfort si dispo)
+    Agrège dans un seul DataFrame: une ligne par ticker avec nos colonnes cibles.
+    """
+    all_rows = []
+    for i in range(0, len(tickers), YQ_CHUNK):
+        batch = tickers[i:i+YQ_CHUNK]
+        t = Ticker(batch, asynchronous=True)
+
+        # Dicos par module
+        fd = t.financial_data or {}
+        sd = t.summary_detail or {}
+        ks = t.key_stats or {}  # peut être vide selon symboles
+
+        for sym in batch:
+            row = {"ticker": sym}
+            # helper pour piocher dans les 3 dicos
+            def g(key):
+                # ordre de priorité : financial_data -> summary_detail -> key_stats
+                v = None
+                if isinstance(fd.get(sym), dict):
+                    v = fd[sym].get(key, None)
+                if v is None and isinstance(sd.get(sym), dict):
+                    v = sd[sym].get(key, None)
+                if v is None and isinstance(ks.get(sym), dict):
+                    v = ks[sym].get(key, None)
+                return v
+
+            # map champs
+            for yq_key, (_, our_name) in YQ_FIELDS.items():
+                row[our_name] = g(yq_key)
+
+            all_rows.append(row)
+
+        # petite pause douce pour éviter throttling
+        time.sleep(0.4)
+
+    df = pd.DataFrame(all_rows).drop_duplicates(subset=["ticker"], keep="last").reset_index(drop=True)
+    return df
 
 # ------------------------
 # SCORING
 # ------------------------
-def pctile_or_neutral(s: pd.Series) -> pd.Series:
-    s2 = pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan)
-    if s2.dropna().empty:
-        return pd.Series(50.0, index=s.index)
-    return 100 * s2.fillna(s2.median()).rank(pct=True)
-
-def compute_score(df: pd.DataFrame):
+def compute_score_yahoo(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
-    q1 = pctile_or_neutral(d["roic"])
-    q2 = pctile_or_neutral(d["gross_margin"])
-    q3 = pctile_or_neutral(d["net_margin"])
-    quality = (q1 + q2 + q3) / 3.0
 
-    g1 = pctile_or_neutral(d["revenue_growth"])
-    g2 = pctile_or_neutral(d["eps_growth"])
-    growth = (g1 + g2) / 2.0
+    # Sous-scores
+    q_cols = ["gross_margin", "net_margin", "roe"]
+    g_cols = ["revenue_growth", "eps_growth"]
+    s_cols = ["debt_to_equity", "current_ratio"]  # quick_ratio reste informatif
 
-    s1 = pctile_or_neutral(-pd.to_numeric(d["debt_to_equity"], errors="coerce"))
-    s2 = pctile_or_neutral(d["interest_coverage"])
-    safety = (s1 + s2) / 2.0
+    # Inversion sur D/E (plus bas = mieux)
+    inv_de = -pd.to_numeric(d["debt_to_equity"], errors="coerce")
+    d["_inv_de"] = inv_de
+
+    # Construire percentiles (neutre 50 si colonne vide)
+    q = [pctile_or_neutral(pd.to_numeric(d[c], errors="coerce")) for c in q_cols]
+    quality = sum(q) / len(q)
+
+    g = [pctile_or_neutral(pd.to_numeric(d[c], errors="coerce")) for c in g_cols]
+    growth = sum(g) / len(g)
+
+    s = [pctile_or_neutral(d["_inv_de"]), pctile_or_neutral(pd.to_numeric(d["current_ratio"], errors="coerce"))]
+    safety = sum(s) / len(s)
 
     score = 0.40*quality + 0.35*growth + 0.25*safety
 
@@ -183,13 +198,18 @@ def compute_score(df: pd.DataFrame):
         "growth": growth.round(2),
         "safety": safety.round(2),
         "score": score.round(2),
-        "roic": d["roic"],
+        # Exposer quelques champs bruts utiles
         "gross_margin": d["gross_margin"],
         "net_margin": d["net_margin"],
+        "roe": d["roe"],
         "revenue_growth": d["revenue_growth"],
         "eps_growth": d["eps_growth"],
         "debt_to_equity": d["debt_to_equity"],
-        "interest_coverage": d["interest_coverage"],
+        "current_ratio": d["current_ratio"],
+        "quick_ratio": d.get("quick_ratio", np.nan),
+        "pe": d.get("pe", np.nan),
+        "pb": d.get("pb", np.nan),
+        "beta": d.get("beta", np.nan),
     })
     return out
 
@@ -204,7 +224,7 @@ with col2:
 with col3:
     show_raw = st.checkbox("Afficher un échantillon brut", value=False)
 
-run_btn = st.button("🔎 Lancer l’analyse fondamentale (FMP)")
+run_btn = st.button("🔎 Lancer l’analyse fondamentale (Yahoo)")
 
 # ------------------------
 # MAIN
@@ -217,37 +237,29 @@ if run_btn:
         universe = universe.head(int(limit_names))
     st.write(f"Univers chargé : **{len(universe)}** tickers")
 
-    rows = []
-    prog = st.progress(0)
     tickers = universe["ticker"].tolist()
 
-    for i, t in enumerate(tickers):
-        prog.progress((i+1)/len(tickers))
-        try:
-            d = get_funda_for(t)
-            if d:
-                rows.append(d)
-        except Exception:
-            continue
+    with st.spinner("Récupération des fondamentaux Yahoo (batchs)..."):
+        funda = fetch_yahoo_fundamentals(tickers)
 
-    st.write(f"📦 Fondamentaux récupérés via FMP : **{len(rows)}** / {len(universe)}")
-    if len(rows) == 0:
-        st.warning("Aucune donnée récupérée depuis FMP. Vérifie ta clé FMP_API_KEY (ou crée-en une gratuite), puis réessaie.")
+    st.write(f"📦 Fondamentaux récupérés via Yahoo : **{len(funda)}** / {len(universe)}")
+
+    if len(funda) == 0:
+        st.warning("Aucune donnée récupérée via Yahoo. Réessaie plus tard ou réduis le nombre de tickers.")
         st.stop()
 
-    raw = pd.DataFrame(rows)
     if show_raw:
-        st.subheader("Échantillon brut (FMP)")
-        st.dataframe(raw.head(10))
+        st.subheader("Échantillon brut (Yahoo)")
+        st.dataframe(funda.head(10))
 
-    scored = compute_score(raw)
+    scored = compute_score_yahoo(funda)
     merged = universe.merge(scored, on="ticker", how="inner")
     out = merged[merged["score"] >= min_score].sort_values("score", ascending=False).reset_index(drop=True)
 
-    st.subheader("📋 Résultats (FMP fondamentaux)")
+    st.subheader("📋 Résultats (Yahoo fondamentaux)")
     st.dataframe(out)
 
     st.download_button("📥 Exporter CSV",
                        data=out.to_csv(index=False),
-                       file_name="sp500_fundamentals_fmp.csv",
+                       file_name="sp500_fundamentals_yahoo.csv",
                        mime="text/csv")
