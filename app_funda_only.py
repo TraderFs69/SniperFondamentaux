@@ -1,5 +1,6 @@
 import os
 import time
+import io
 import pandas as pd
 import numpy as np
 import requests
@@ -12,7 +13,6 @@ import streamlit as st
 st.set_page_config(page_title="S&P 500 — Fundamentals Only (Polygon)", layout="wide")
 st.title("📘 S&P 500 — Fundamentals Only (Polygon)")
 
-# Charge la clé API Polygon depuis le fichier .env
 load_dotenv()
 POLY = os.getenv("POLYGON_API_KEY")
 
@@ -21,29 +21,10 @@ if not POLY:
     st.stop()
 
 # ------------------------
-# FONCTIONS UTILES
+# HELPERS
 # ------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_sp500_from_wikipedia():
-    """
-    Va chercher la liste officielle des compagnies du S&P 500 sur Wikipédia.
-    """
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    tables = pd.read_html(url)
-    for t in tables:
-        if "Symbol" in t.columns:
-            t["Symbol"] = t["Symbol"].astype(str).str.strip()
-            t["Symbol"] = t["Symbol"].str.replace(r"[^\w\.\-]", "", regex=True)
-            return t[["Symbol", "Security", "GICS Sector", "GICS Sub-Industry"]].rename(columns={
-                "Symbol": "ticker",
-                "Security": "name",
-                "GICS Sector": "sector",
-                "GICS Sub-Industry": "industry"
-            })
-    raise RuntimeError("Impossible de trouver la table du S&P 500 sur Wikipédia.")
-
 def api_get(url: str, params: dict = None, tries: int = 3, sleep: float = 0.8):
-    """Requête GET avec reprise automatique si échec"""
+    """Requête GET avec reprise automatique."""
     params = params or {}
     for i in range(tries):
         try:
@@ -58,7 +39,7 @@ def api_get(url: str, params: dict = None, tries: int = 3, sleep: float = 0.8):
     return None
 
 def get_in(d: dict, path: str, default=np.nan):
-    """Accès sécurisé à une clé imbriquée dans un dictionnaire JSON"""
+    """Accès sécurisé dans un dict imbriqué."""
     if d is None:
         return default
     cur = d
@@ -69,17 +50,97 @@ def get_in(d: dict, path: str, default=np.nan):
     return cur
 
 def normalize_percentile(s: pd.Series):
-    """Convertit une série en percentiles (0–100)"""
     return 100 * s.rank(pct=True)
 
 # ------------------------
-# RÉCUPÉRATION DES FONDAMENTAUX POLYGON
+# S&P 500 UNIVERSE (robuste)
+# ------------------------
+WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+FALLBACK_CSVS = [
+    # Fallbacks publics maintenus (si Wikipédia bloque)
+    "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv",
+    "https://datahub.io/core/s-and-p-500-companies/r/constituents.csv",
+]
+
+@st.cache_data(ttl=3600)
+def fetch_sp500_from_wikipedia():
+    """Tente Wikipédia avec User-Agent; si échec, déclenche une exception capturée en amont."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+    r = requests.get(WIKI_URL, headers=headers, timeout=30)
+    r.raise_for_status()  # Provoque HTTPError si bloqué
+    # read_html depuis le contenu récupéré (évite lecture directe par URL)
+    tables = pd.read_html(io.StringIO(r.text))
+    for t in tables:
+        if "Symbol" in t.columns:
+            t["Symbol"] = t["Symbol"].astype(str).str.strip()
+            t["Symbol"] = t["Symbol"].str.replace(r"[^\w\.\-]", "", regex=True)
+            return t[["Symbol", "Security", "GICS Sector", "GICS Sub-Industry"]].rename(
+                columns={
+                    "Symbol": "ticker",
+                    "Security": "name",
+                    "GICS Sector": "sector",
+                    "GICS Sub-Industry": "industry",
+                }
+            )
+    raise RuntimeError("Table du S&P 500 introuvable dans la page Wikipédia.")
+
+@st.cache_data(ttl=3600)
+def fetch_sp500_fallback():
+    """Essaie des CSV publics si Wikipédia est bloqué."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+    last_err = None
+    for url in FALLBACK_CSVS:
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
+            r.raise_for_status()
+            df = pd.read_csv(io.StringIO(r.text))
+            # Harmonisation des noms de colonnes potentiels
+            colmap = {}
+            for c in df.columns:
+                lc = c.lower()
+                if lc.startswith("symbol"):
+                    colmap[c] = "ticker"
+                elif lc.startswith("security") or lc.startswith("name"):
+                    colmap[c] = "name"
+                elif "sector" in lc:
+                    colmap[c] = "sector"
+                elif "sub" in lc and "industry" in lc:
+                    colmap[c] = "industry"
+            df = df.rename(columns=colmap)
+            keep = [c for c in ["ticker", "name", "sector", "industry"] if c in df.columns]
+            if "ticker" in keep:
+                df["ticker"] = df["ticker"].astype(str).str.strip()
+                return df[keep]
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"Impossible de charger l'univers S&P 500 via les fallbacks. Dernière erreur: {last_err}")
+
+def fetch_sp500_universe():
+    """Stratégie: Wikipédia -> fallback(s)."""
+    try:
+        return fetch_sp500_from_wikipedia()
+    except Exception as e:
+        st.warning(f"Wikipédia indisponible/bloqué ({e}). Bascule vers une source de secours.")
+        return fetch_sp500_fallback()
+
+# ------------------------
+# POLYGON FUNDAMENTALS
 # ------------------------
 def polygon_financials_ttm(ticker: str, limit=4):
-    """
-    Récupère les derniers états financiers d'une compagnie depuis Polygon.
-    Utilise le endpoint vX/reference/financials.
-    """
+    """Récupère les derniers fondamentaux (vX/reference/financials)."""
     url = "https://api.polygon.io/vX/reference/financials"
     params = {"ticker": ticker, "limit": limit, "apiKey": POLY}
     js = api_get(url, params=params)
@@ -89,7 +150,7 @@ def polygon_financials_ttm(ticker: str, limit=4):
     if not results:
         return None
 
-    # Trie les périodes par date
+    # Tri par date de fin de période (desc)
     rows = []
     for r in results:
         period_end = get_in(r, "fiscal_period_end", None) or get_in(r, "end_date", None)
@@ -100,28 +161,21 @@ def polygon_financials_ttm(ticker: str, limit=4):
     rows.sort(key=lambda x: x[0], reverse=True)
     ordered = [r for _, r in rows]
 
-    def extract_block(rec):
-        gross_margin = get_in(rec, "ratios.gross_margin")
-        net_margin = get_in(rec, "ratios.net_margin")
-        roic = get_in(rec, "ratios.roic")
-        revenue_ttm = get_in(rec, "ttm.revenue")
-        eps_ttm = get_in(rec, "ttm.eps")
-        debt_to_equity = get_in(rec, "ratios.debt_to_equity")
-        interest_coverage = get_in(rec, "ratios.interest_coverage")
+    def block(rec):
         return dict(
-            gross_margin=gross_margin,
-            net_margin=net_margin,
-            roic=roic,
-            revenue_ttm=revenue_ttm,
-            eps_ttm=eps_ttm,
-            debt_to_equity=debt_to_equity,
-            interest_coverage=interest_coverage,
+            gross_margin=get_in(rec, "ratios.gross_margin"),
+            net_margin=get_in(rec, "ratios.net_margin"),
+            roic=get_in(rec, "ratios.roic"),
+            revenue_ttm=get_in(rec, "ttm.revenue"),
+            eps_ttm=get_in(rec, "ttm.eps"),
+            debt_to_equity=get_in(rec, "ratios.debt_to_equity"),
+            interest_coverage=get_in(rec, "ratios.interest_coverage"),
         )
 
-    latest = extract_block(ordered[0])
-    prev = extract_block(ordered[1]) if len(ordered) > 1 else {k: np.nan for k in latest.keys()}
+    latest = block(ordered[0])
+    prev = block(ordered[1]) if len(ordered) > 1 else {k: np.nan for k in latest.keys()}
 
-    out = {
+    return {
         "ticker": ticker,
         "roic": latest["roic"],
         "gross_margin": latest["gross_margin"],
@@ -133,10 +187,9 @@ def polygon_financials_ttm(ticker: str, limit=4):
         "debt_to_equity": latest["debt_to_equity"],
         "interest_coverage": latest["interest_coverage"],
     }
-    return out
 
 # ------------------------
-# CALCUL DU SCORE FONDAMENTAL
+# SCORING
 # ------------------------
 def compute_fundamental_score(df: pd.DataFrame):
     d = df.copy()
@@ -157,10 +210,8 @@ def compute_fundamental_score(df: pd.DataFrame):
 
     quality = (pctile("roic") + pctile("gross_margin") + pctile("net_margin")) / 3.0
     growth = (pctile("rev_growth") + pctile("eps_growth")) / 2.0
-    safety = (
-        normalize_percentile((-d["debt_to_equity"]).replace([np.inf, -np.inf], np.nan).fillna(0))
-        + pctile("interest_coverage")
-    ) / 2.0
+    safety = (normalize_percentile((-d["debt_to_equity"]).replace([np.inf, -np.inf], np.nan).fillna(0))
+              + pctile("interest_coverage")) / 2.0
 
     score = 0.40 * quality + 0.35 * growth + 0.25 * safety
     out = d[["ticker"]].copy()
@@ -171,7 +222,7 @@ def compute_fundamental_score(df: pd.DataFrame):
     return out
 
 # ------------------------
-# INTERFACE UTILISATEUR
+# UI
 # ------------------------
 col1, col2 = st.columns(2)
 with col1:
@@ -182,11 +233,11 @@ with col2:
 run_btn = st.button("🔎 Lancer l’analyse fondamentale")
 
 # ------------------------
-# LOGIQUE PRINCIPALE
+# MAIN
 # ------------------------
 if run_btn:
-    with st.spinner("Récupération de la liste S&P 500 depuis Wikipédia..."):
-        universe_df = fetch_sp500_from_wikipedia()
+    with st.spinner("Chargement de l'univers S&P 500..."):
+        universe_df = fetch_sp500_universe()
 
     if limit_names and limit_names > 0:
         universe_df = universe_df.head(int(limit_names))
@@ -214,7 +265,7 @@ if run_btn:
     scored = compute_fundamental_score(raw_df)
     merged = universe_df.merge(scored, on="ticker", how="inner")
 
-    # Filtrage
+    # Filtrage + affichage
     out = merged[merged["score"] >= min_score].sort_values("score", ascending=False).reset_index(drop=True)
 
     st.subheader("📋 Résultats (fondamentaux uniquement)")
